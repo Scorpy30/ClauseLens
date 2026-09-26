@@ -248,10 +248,13 @@ def test_comparison_keeps_findings_and_citations_document_scoped(client, monkeyp
     assert result["status"] == "SUPPORTED"
     assert "All 3 selected documents" in result["answer"]
     assert "60 days' written notice" in result["answer"]
+    assert "Notice waiver:" not in str(result)
     assert len(result["per_document"]) == 3
     for finding in result["per_document"]:
         assert finding["answer"]["evidence"]
         assert "60 days' written notice" in finding["answer"]["answer"]
+    security_finding = result["per_document"][0]
+    assert all(item["section"] != "14" for item in security_finding["answer"]["evidence"])
 
     detail = client.get(
         f"/workspaces/{workspace_id}/conversations/{conversation['conversation_id']}"

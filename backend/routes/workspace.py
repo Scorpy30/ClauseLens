@@ -165,12 +165,9 @@ def _comparison_sentences(
 
     for chunk_index, chunk in enumerate(chunks):
         text = " ".join(chunk.text.split())
+        text = re.split(r"\bTESTING REFERENCE POINTS\b", text, maxsplit=1, flags=re.IGNORECASE)[0]
         for sentence_index, sentence in enumerate(re.split(r"(?<=[.!?])\s+", text)):
             sentence = sentence.strip()
-            # Security fixtures include a test-only reference appendix; it is not
-            # contractual wording and should not compete with operative clauses.
-            if "testing reference points" in sentence.lower():
-                continue
             canonical = " ".join(re.findall(r"[a-z0-9]+", sentence.lower()))
             if not canonical or canonical in seen:
                 continue
