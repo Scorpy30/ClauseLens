@@ -175,6 +175,41 @@ def test_document_count_questions_use_parsed_metadata_without_gemini(client, mon
     assert detail["messages"][-1]["content"] == "3"
 
 
+def test_notice_avoidance_question_does_not_infer_legal_consequences(client, monkeypatch):
+    workspace_id = client.post("/workspaces").json()["workspace_id"]
+    document = upload_document(client, f"/workspaces/{workspace_id}/documents")
+    conversation = client.post(
+        f"/workspaces/{workspace_id}/conversations",
+        json={"active_document_id": document["document_id"]},
+    ).json()
+    monkeypatch.setattr(
+        "backend.routes.workspace.map_topics",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("notice questions should use direct retrieval")),
+    )
+    monkeypatch.setattr(
+        GeminiClient,
+        "__init__",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("notice limits must be deterministic")),
+    )
+
+    response = client.post(
+        f"/workspaces/{workspace_id}/conversations/{conversation['conversation_id']}/questions",
+        json={
+            "question": "Are you sure I can leave my current job without having to serve the notice period?"
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    answer = response.json()["answer"]
+    assert answer["status"] == "PARTIALLY_SUPPORTED"
+    assert "60-day written notice requirement" in answer["answer"]
+    assert "may waive all or part" in answer["answer"]
+    assert "does not establish what would happen" in answer["answer"]
+    assert "cannot" not in answer["answer"].lower()
+    assert answer["evidence"]
+    assert answer["evidence"][0]["section"] == "4"
+
+
 def test_follow_up_context_is_bounded_and_document_scoped(client, monkeypatch):
     workspace_id = client.post("/workspaces").json()["workspace_id"]
     first_doc = upload_document(client, f"/workspaces/{workspace_id}/documents", "first.pdf")
@@ -334,3 +369,77 @@ def test_comparison_downgrades_uncited_claims(client, monkeypatch):
     assert result["status"] == "INSUFFICIENT_EVIDENCE"
     assert all(item["answer"]["status"] == "INSUFFICIENT_EVIDENCE" for item in result["per_document"])
     assert all(not item["answer"]["evidence"] for item in result["per_document"])
+
+
+def test_document_nature_comparison_profiles_each_source_independently(client, monkeypatch):
+    workspace_id = client.post("/workspaces").json()["workspace_id"]
+    first = upload_document(
+        client,
+        f"/workspaces/{workspace_id}/documents",
+        "first.pdf",
+        Path("tests") / "sample.pdf",
+    )
+    second = upload_document(
+        client,
+        f"/workspaces/{workspace_id}/documents",
+        "second.pdf",
+        Path("tests") / "ClauseLens_Security_Test_Employment_Agreement.pdf",
+    )
+    conversation = client.post(
+        f"/workspaces/{workspace_id}/conversations",
+        json={"active_document_id": first["document_id"]},
+    ).json()
+    profiled_documents = []
+    comparison_inputs = []
+
+    monkeypatch.setattr(GeminiClient, "__init__", lambda self, *args, **kwargs: None)
+
+    def profile_document(self, evidence):
+        document_ids = {item["document_id"] for item in evidence}
+        assert len(document_ids) == 1
+        profiled_documents.extend(document_ids)
+        source = evidence[0]
+        return {
+            "status": "SUPPORTED",
+            "document_type": "Employment agreement",
+            "purpose": "Sets out employment terms between a company and an employee.",
+            "key_subjects": ["employment", "termination"],
+            "answer": "This appears to be an employment agreement covering employment terms.",
+            "explanation": "This is a broad description of the document.",
+            "evidence": [{
+                "chunk_id": source["chunk_id"],
+                "page_number": source["page_number"],
+                "section": source["section"],
+            }],
+            "missing_information": [],
+            "follow_up_questions": [],
+        }
+
+    def compare_profiles(self, question, profiles):
+        comparison_inputs.extend(profiles)
+        return {
+            "status": "SUPPORTED",
+            "answer": "They appear similar in nature: both are employment agreements.",
+            "explanation": "Both profiles describe agreements setting out employment terms.",
+            "missing_information": [],
+            "follow_up_questions": [],
+        }
+
+    monkeypatch.setattr(GeminiClient, "generate_document_profile", profile_document)
+    monkeypatch.setattr(GeminiClient, "compare_document_profiles", compare_profiles)
+    response = client.post(
+        f"/workspaces/{workspace_id}/conversations/{conversation['conversation_id']}/comparisons",
+        json={
+            "question": "Are both documents more or less the same in nature?",
+            "document_ids": [first["document_id"], second["document_id"]],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["status"] == "SUPPORTED"
+    assert "similar in nature" in result["answer"]
+    assert len(profiled_documents) == 2
+    assert {profile["filename"] for profile in comparison_inputs} == {"first.pdf", "second.pdf"}
+    for finding in result["per_document"]:
+        assert finding["answer"]["evidence"]

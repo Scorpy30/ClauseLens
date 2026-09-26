@@ -62,6 +62,9 @@ router = APIRouter(prefix="/workspaces", tags=["workspace"])
 
 MAX_FILE_SIZE = 15 * 1024 * 1024  # 15 MB
 MAX_HISTORY_TURNS = 3
+MAX_PROFILE_CHUNKS = 14
+MAX_PROFILE_CHARS = 12000
+MAX_PROFILE_CHUNK_CHARS = 1500
 DOCUMENT_COUNT_RE = re.compile(
     r"\b(?:how many|number of|count of|total number of)\s+"
     r"(?P<kind>clauses?|sections?|pages?)\b|"
@@ -205,6 +208,217 @@ def _document_count(document: Document, kind: str) -> int | None:
         if chunk.section and chunk.section.strip()
     }
     return len(section_numbers) if section_numbers else None
+
+
+def _is_document_nature_question(question: str) -> bool:
+    return bool(re.search(
+        r"\b(?:nature|kind|type|purpose)\b|"
+        r"\bwhat\s+(?:are|is)\s+(?:these|both|the selected)\s+documents\b",
+        question,
+        re.IGNORECASE,
+    ))
+
+
+def _profile_evidence(chunks: list[EvidenceChunk]) -> list[EvidenceChunk]:
+    if not chunks:
+        return []
+    if len(chunks) <= MAX_PROFILE_CHUNKS and sum(len(c.text) for c in chunks) <= MAX_PROFILE_CHARS:
+        return chunks
+
+    sample_count = min(len(chunks), MAX_PROFILE_CHUNKS)
+    indices = sorted({
+        round(index * (len(chunks) - 1) / max(sample_count - 1, 1))
+        for index in range(sample_count)
+    })
+    selected = []
+    remaining_chars = MAX_PROFILE_CHARS
+    for index in indices:
+        if remaining_chars <= 0:
+            break
+        chunk = chunks[index]
+        excerpt = chunk.text[:min(MAX_PROFILE_CHUNK_CHARS, remaining_chars)]
+        selected.append(chunk.model_copy(update={"text": excerpt}))
+        remaining_chars -= len(excerpt)
+    return selected
+
+
+def _semantic_nature_comparison(
+    question: str,
+    documents: list[Document],
+) -> tuple[str, str, str, list[ComparisonFinding], list[str], list[str]]:
+    gemini = GeminiClient()
+    findings = []
+    profiles = []
+
+    for document in documents:
+        selected_chunks = _profile_evidence(document.evidence)
+        raw_profile = gemini.generate_document_profile([
+            {
+                "chunk_id": chunk.chunk_id,
+                "document_id": document.document_id,
+                "page_number": chunk.page_number,
+                "section": chunk.section,
+                "text": chunk.text,
+            }
+            for chunk in selected_chunks
+        ])
+        raw_profile = raw_profile if isinstance(raw_profile, dict) else {}
+        profile_answer = parse_gemini_answer(raw_profile)
+        raw_document_type = raw_profile.get("document_type")
+        raw_purpose = raw_profile.get("purpose")
+        document_type = raw_document_type.strip()[:120] if isinstance(raw_document_type, str) else "unknown"
+        purpose = raw_purpose.strip()[:500] if isinstance(raw_purpose, str) else "unknown"
+        valid_profile = (
+            profile_answer.status in {"SUPPORTED", "PARTIALLY_SUPPORTED"}
+            and bool(profile_answer.evidence)
+            and validate_answer_evidence(
+                answer=profile_answer,
+                evidence=selected_chunks,
+                document_id=document.document_id,
+            )
+        )
+        valid_profile = valid_profile and document_type.lower() not in {"", "unknown", "not established"}
+        valid_profile = valid_profile and purpose.lower() not in {"", "unknown", "not established"}
+
+        evidence_refs = [
+            MessageEvidence(
+                chunk_id=item.chunk_id,
+                document_id=document.document_id,
+                page_number=item.page_number,
+                section=item.section,
+            )
+            for item in profile_answer.evidence
+        ] if valid_profile else []
+        if valid_profile:
+            finding_status = profile_answer.status
+            finding_answer = f"Document type: {document_type}. {purpose}"
+            finding_explanation = "This is a broad, evidence-cited description; it does not establish identical terms or legal effect."
+            profiles.append({
+                "filename": document.filename,
+                "document_type": document_type,
+                "purpose": purpose,
+                "key_subjects": [
+                    subject for subject in raw_profile.get("key_subjects", [])
+                    if isinstance(subject, str) and subject.strip()
+                ][:4] if isinstance(raw_profile.get("key_subjects", []), list) else [],
+            })
+            missing = profile_answer.missing_information
+        else:
+            finding_status = "INSUFFICIENT_EVIDENCE"
+            finding_answer = "ClauseLens could not determine this document's nature reliably from the available text."
+            finding_explanation = "A reliable, cited document profile was not available."
+            missing = ["A reliable document type and purpose supported by source text."]
+
+        findings.append(ComparisonFinding(
+            document_id=document.document_id,
+            filename=document.filename,
+            answer=finding_answer,
+            explanation=finding_explanation,
+            answer_status=finding_status,
+            missing_information=missing,
+            follow_up_questions=profile_answer.follow_up_questions if valid_profile else [],
+            evidence=evidence_refs,
+        ))
+
+    if len(profiles) != len(documents):
+        if not profiles:
+            status = "INSUFFICIENT_EVIDENCE"
+            answer = "The nature of the selected documents could not be determined from cited text."
+        else:
+            status = "PARTIALLY_SUPPORTED"
+            answer = f"ClauseLens could determine the nature of {len(profiles)} of {len(documents)} documents, but not all of them."
+        explanation = "Each document is profiled separately; review the cited passages for the available profiles."
+        missing_information = [
+            f"{finding.filename}: {item}"
+            for finding in findings
+            for item in finding.missing_information
+        ]
+        return status, answer, explanation, findings, missing_information, []
+
+    comparison = gemini.compare_document_profiles(question, profiles)
+    comparison = comparison if isinstance(comparison, dict) else {}
+    status = comparison.get("status")
+    if status not in {"SUPPORTED", "PARTIALLY_SUPPORTED", "INSUFFICIENT_EVIDENCE"}:
+        status = "INSUFFICIENT_EVIDENCE"
+    if status == "SUPPORTED" and any(
+        finding.answer_status != "SUPPORTED" for finding in findings
+    ):
+        status = "PARTIALLY_SUPPORTED"
+    answer = str(comparison.get("answer") or "The document profiles could not be compared reliably.")
+    explanation = str(comparison.get("explanation") or "Review each cited document profile before drawing conclusions.")
+    explanation += " Broad similarity does not mean the documents contain identical terms or have identical legal effect."
+    missing_information = comparison.get("missing_information", [])
+    follow_up_questions = comparison.get("follow_up_questions", [])
+    if not isinstance(missing_information, list):
+        missing_information = []
+    if not isinstance(follow_up_questions, list):
+        follow_up_questions = []
+    return status, answer, explanation, findings, missing_information, follow_up_questions
+
+
+def _is_notice_avoidance_question(question: str) -> bool:
+    question_text = question.lower()
+    return bool(
+        re.search(r"\bnotice\b", question_text)
+        and re.search(
+            r"\b(?:without|skip(?:ping)?|avoid(?:ing)?|bypass(?:ing)?|before|instead of)\b",
+            question_text,
+        )
+    )
+
+
+def _notice_avoidance_answer(
+    question: str,
+    evidence: list[EvidenceChunk],
+) -> LegalAnswer | None:
+    if not _is_notice_avoidance_question(question):
+        return None
+
+    notice_chunks = [
+        chunk for chunk in evidence
+        if re.search(r"\bnotice\b", chunk.text, re.IGNORECASE)
+        and re.search(r"\b\d+\s+days?\b", chunk.text, re.IGNORECASE)
+    ]
+    if not notice_chunks:
+        return None
+
+    waiver_chunks = [
+        chunk for chunk in evidence
+        if re.search(r"\bwaiv\w*\b", chunk.text, re.IGNORECASE)
+        and re.search(r"\bnotice\b", chunk.text, re.IGNORECASE)
+    ]
+    selected_chunks = list(
+        {chunk.chunk_id: chunk for chunk in notice_chunks + waiver_chunks}.values()
+    )
+    notice_text = " ".join(chunk.text for chunk in notice_chunks)
+    duration = re.search(r"\b(\d+)\s+days?\b", notice_text, re.IGNORECASE)
+    requirement = (
+        f"The document states a {duration.group(1)}-day written notice requirement."
+        if duration and re.search(r"\bwritten\s+notice\b", notice_text, re.IGNORECASE)
+        else "The document states a notice-period requirement."
+    )
+    waiver = (
+        " It also says the Company may waive all or part of the notice period."
+        if waiver_chunks else ""
+    )
+    return LegalAnswer(
+        status="PARTIALLY_SUPPORTED",
+        answer=(
+            f"{requirement}{waiver} The document does not establish what would happen "
+            "if you left before serving the notice period."
+        ),
+        explanation="",
+        evidence=[
+            {
+                "chunk_id": chunk.chunk_id,
+                "page_number": chunk.page_number,
+                "section": chunk.section,
+            }
+            for chunk in selected_chunks
+        ],
+        missing_information=["Consequences, if any, of leaving before the notice period ends."],
+        follow_up_questions=["Will the Company waive the notice period in your case?"],
+    )
 
 
 # ── Workspace lifecycle ────────────────────────────────────────────────────
@@ -537,29 +751,44 @@ def ask_question(
             f"{conversation_context[-1]['question']}"
         )
 
-    # ── Retrieve evidence from the active document ─────────────────────────
-    topics = map_topics(retrieval_query, document.evidence)
-
-    if request.topic and request.topic in topics:
-        topic_evidence = get_evidence_for_topics([request.topic], document.evidence)
-        relevant_evidence = topic_evidence.get(request.topic, [])
-    else:
-        topic_evidence = get_evidence_for_topics(topics, document.evidence)
-        relevant_evidence = []
-        seen = set()
-        for chunks in topic_evidence.values():
-            for chunk in chunks:
-                if chunk.chunk_id not in seen:
-                    relevant_evidence.append(chunk)
-                    seen.add(chunk.chunk_id)
-
-    # Fall back to direct retrieval if topic mapper produced nothing
-    if not relevant_evidence:
+    # Retrieve directly for notice-avoidance questions so unsupported legal
+    # consequences are handled without either Gemini call.
+    answer = None
+    relevant_evidence = []
+    if _is_notice_avoidance_question(request.question):
         relevant_evidence = retrieve_evidence(
             query=retrieval_query,
             evidence=document.evidence,
             top_k=5,
         )
+        answer = _notice_avoidance_answer(request.question, relevant_evidence)
+
+    if answer is None:
+        # ── Retrieve evidence from the active document ─────────────────────
+        topics = map_topics(retrieval_query, document.evidence)
+
+        if request.topic and request.topic in topics:
+            topic_evidence = get_evidence_for_topics([request.topic], document.evidence)
+            relevant_evidence = topic_evidence.get(request.topic, [])
+        else:
+            topic_evidence = get_evidence_for_topics(topics, document.evidence)
+            relevant_evidence = []
+            seen = set()
+            for chunk_group in topic_evidence.values():
+                for chunk in chunk_group:
+                    if chunk.chunk_id not in seen:
+                        relevant_evidence.append(chunk)
+                        seen.add(chunk.chunk_id)
+
+        # Fall back to direct retrieval if topic mapping produced nothing.
+        if not relevant_evidence:
+            relevant_evidence = retrieve_evidence(
+                query=retrieval_query,
+                evidence=document.evidence,
+                top_k=5,
+            )
+
+        answer = _notice_avoidance_answer(request.question, relevant_evidence)
 
     evidence_for_gemini = [
         {
@@ -571,15 +800,18 @@ def ask_question(
         for c in relevant_evidence
     ]
 
-    # ── Call Gemini with bounded context ──────────────────────────────────
-    gemini = GeminiClient()
-    raw_answer = gemini.generate_legal_answer(
-        situation=request.question,
-        evidence=evidence_for_gemini,
-        conversation_context=conversation_context,
-    )
+    # Avoid model-made legal conclusions for notice-avoidance questions when
+    # the document states a notice rule but not the consequences of leaving early.
+    if answer is None:
+        # ── Call Gemini with bounded context ────────────────────────────────
+        gemini = GeminiClient()
+        raw_answer = gemini.generate_legal_answer(
+            situation=request.question,
+            evidence=evidence_for_gemini,
+            conversation_context=conversation_context,
+        )
 
-    answer = parse_gemini_answer(raw_answer)
+        answer = parse_gemini_answer(raw_answer)
 
     # ── Grounding validation ───────────────────────────────────────────────
     if not validate_answer_evidence(
@@ -657,13 +889,74 @@ def compare_documents(
     if len(set(request.document_ids)) != len(request.document_ids):
         raise HTTPException(status_code=400, detail="Each document can only be selected once.")
 
-    document_results = []
+    documents = []
     for document_id in request.document_ids:
         if document_id not in ws.document_ids:
             raise HTTPException(status_code=400, detail="Every compared document must belong to this workspace.")
         document = get_document(document_id)
         if document is None:
             raise HTTPException(status_code=404, detail="A compared document is no longer available.")
+        documents.append(document)
+
+    if _is_document_nature_question(request.question):
+        status, answer_text, explanation, findings, missing_information, follow_up_questions = (
+            _semantic_nature_comparison(request.question, documents)
+        )
+        user_message = ConversationMessage(
+            message_id=str(uuid.uuid4()),
+            role="user",
+            content=request.question,
+        )
+        assistant_message = ConversationMessage(
+            message_id=str(uuid.uuid4()),
+            role="assistant",
+            content=answer_text,
+            answer_status=status,
+            explanation=explanation,
+            missing_information=missing_information,
+            follow_up_questions=follow_up_questions,
+            evidence=[item for finding in findings for item in finding.evidence],
+            comparison_findings=findings,
+        )
+        conv.messages.extend([user_message, assistant_message])
+        if conv.title == "New conversation":
+            conv.title = request.question.strip()[:80]
+        save_conversation(conv)
+
+        return ComparisonResponse(
+            message_id=assistant_message.message_id,
+            status=status,
+            answer=answer_text,
+            explanation=explanation,
+            per_document=[
+                CompareDocumentResult(
+                    document_id=finding.document_id,
+                    filename=finding.filename,
+                    answer=LegalAnswer(
+                        status=finding.answer_status,
+                        answer=finding.answer,
+                        explanation=finding.explanation,
+                        evidence=[
+                            {
+                                "chunk_id": item.chunk_id,
+                                "page_number": item.page_number,
+                                "section": item.section,
+                            }
+                            for item in finding.evidence
+                        ],
+                        missing_information=finding.missing_information,
+                        follow_up_questions=finding.follow_up_questions,
+                    ),
+                )
+                for finding in findings
+            ],
+            missing_information=missing_information,
+            follow_up_questions=follow_up_questions,
+        )
+
+    document_results = []
+    for document in documents:
+        document_id = document.document_id
 
         chunks = retrieve_evidence(request.question, document.evidence, top_k=5)
         candidates = _comparison_sentences(request.question, chunks)
