@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#f5f7f8">
+    <title>ClauseLens | Legal document workspace</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header class="topbar">
+        <a class="brand" href="#" aria-label="ClauseLens workspace">
+            <span class="brand-mark" aria-hidden="true">C</span>
+            <span>ClauseLens</span>
+        </a>
+        <p class="tagline">Understand what your legal documents actually say.</p>
+        <span class="legal-note">Legal information, not legal advice</span>
+    </header>
+
+    <main class="workspace">
+        <aside class="sidebar" aria-label="Workspace navigation">
+            <section class="side-section documents-section">
+                <div class="side-heading">
+                    <h2>Documents</h2>
+                    <button class="icon-button" id="compareModeButton" type="button" title="Compare documents" aria-label="Compare documents" disabled>⇄</button>
+                    <button class="icon-button" id="uploadButton" type="button" title="Add PDF documents" aria-label="Add PDF documents">+</button>
+                    <input id="fileInput" type="file" accept="application/pdf,.pdf" multiple hidden>
+                </div>
+                <p class="side-hint">PDF files · up to 15 MB each</p>
+                <div id="documentList" class="document-list"></div>
+                <p id="compareStatus" class="inline-status"></p>
+                <p id="uploadStatus" class="inline-status" role="status"></p>
+            </section>
+
+            <section class="side-section conversation-section">
+                <div class="side-heading">
+                    <h2>Conversations</h2>
+                    <button class="icon-button" id="newConversationButton" type="button" title="New conversation" aria-label="New conversation">+</button>
+                </div>
+                <div id="conversationList" class="conversation-list"></div>
+            </section>
+
+            <footer class="sidebar-footer">Your workspace stays available while this backend is running.</footer>
+        </aside>
+
+        <section class="main-panel" aria-label="Document conversation">
+            <div id="workspaceNotice" class="workspace-notice" role="status"></div>
+            <div id="conversationHeader" class="conversation-header"></div>
+            <div id="messageList" class="message-list" aria-live="polite"></div>
+            <form id="composer" class="composer">
+                <label class="sr-only" for="questionInput">Ask a question about the selected document</label>
+                <textarea id="questionInput" rows="1" placeholder="Ask a question about this document..." disabled></textarea>
+                <div class="composer-footer">
+                    <span id="composerHint">Select a document to get started.</span>
+                    <button id="sendButton" type="submit" disabled><span aria-hidden="true">↑</span> Send</button>
+                </div>
+            </form>
+        </section>
+    </main>
+
+    <script src="app.js"></script>
+</body>
+</html>
