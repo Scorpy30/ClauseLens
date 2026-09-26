@@ -1,4 +1,5 @@
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 from fastapi.testclient import TestClient
@@ -391,10 +392,12 @@ def test_document_nature_comparison_profiles_each_source_independently(client, m
     ).json()
     profiled_documents = []
     comparison_inputs = []
+    profile_barrier = Barrier(2)
 
     monkeypatch.setattr(GeminiClient, "__init__", lambda self, *args, **kwargs: None)
 
     def profile_document(self, evidence):
+        profile_barrier.wait(timeout=5)
         document_ids = {item["document_id"] for item in evidence}
         assert len(document_ids) == 1
         profiled_documents.extend(document_ids)

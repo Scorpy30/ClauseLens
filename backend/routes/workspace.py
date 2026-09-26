@@ -19,6 +19,7 @@ Route map:
 
 import uuid
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -316,12 +317,16 @@ def _semantic_nature_comparison(
     question: str,
     documents: list[Document],
 ) -> tuple[str, str, str, list[ComparisonFinding], list[str], list[str]]:
-    gemini = GeminiClient()
     findings = []
     profiles = []
 
-    for document in documents:
-        profile, profile_answer, evidence_refs = _generate_valid_document_profile(document, gemini)
+    def profile_document(document: Document):
+        return _generate_valid_document_profile(document, GeminiClient())
+
+    with ThreadPoolExecutor(max_workers=min(len(documents), 4)) as executor:
+        document_profiles = list(executor.map(profile_document, documents))
+
+    for document, (profile, profile_answer, evidence_refs) in zip(documents, document_profiles):
         if profile is not None:
             finding_status = profile_answer.status
             finding_answer = f"Document type: {profile['document_type']}. {profile['purpose']}"
@@ -360,7 +365,7 @@ def _semantic_nature_comparison(
         ]
         return status, answer, explanation, findings, missing_information, []
 
-    comparison = gemini.compare_document_profiles(question, profiles)
+    comparison = GeminiClient().compare_document_profiles(question, profiles)
     comparison = comparison if isinstance(comparison, dict) else {}
     status = comparison.get("status")
     if status not in {"SUPPORTED", "PARTIALLY_SUPPORTED", "INSUFFICIENT_EVIDENCE"}:
