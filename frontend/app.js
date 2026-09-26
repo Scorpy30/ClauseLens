@@ -270,6 +270,16 @@ function renderMessage(message) {
         return renderComparisonMessage(message);
     }
 
+    if (message.message_type === "document_metadata") {
+        const document = state.documents.find((item) => item.document_id === message.document_id);
+        return `
+            <article class="message assistant-message metadata-message">
+                <div class="message-label assistant-label"><span class="assistant-mark" aria-hidden="true">C</span> ClauseLens <span>${escapeHtml(document?.filename || "")}</span></div>
+                <p class="answer-content">${escapeHtml(message.content)}</p>
+            </article>
+        `;
+    }
+
     const status = (message.answer_status || "INSUFFICIENT_EVIDENCE").toLowerCase();
     const evidence = message.evidence || [];
     const sources = evidence.length ? `

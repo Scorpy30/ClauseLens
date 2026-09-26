@@ -130,6 +130,51 @@ def test_conversation_question_persists_grounded_messages(client, monkeypatch):
     assert detail["messages"][1]["explanation"] == "This is stated in the cited clause."
 
 
+def test_document_count_questions_use_parsed_metadata_without_gemini(client, monkeypatch):
+    workspace_id = client.post("/workspaces").json()["workspace_id"]
+    document = upload_document(
+        client,
+        f"/workspaces/{workspace_id}/documents",
+        "ClauseLens_Security_Test_Employment_Agreement.pdf",
+        Path("tests") / "ClauseLens_Security_Test_Employment_Agreement.pdf",
+    )
+    conversation = client.post(
+        f"/workspaces/{workspace_id}/conversations",
+        json={"active_document_id": document["document_id"]},
+    ).json()
+    monkeypatch.setattr(
+        GeminiClient,
+        "__init__",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("metadata counts must not call Gemini")),
+    )
+    endpoint = (
+        f"/workspaces/{workspace_id}/conversations/"
+        f"{conversation['conversation_id']}/questions"
+    )
+
+    clause_count = client.post(
+        endpoint,
+        json={"question": "How many clauses are mentioned in the document?"},
+    )
+    page_count = client.post(
+        endpoint,
+        json={"question": "How many pages does this document have?"},
+    )
+
+    assert clause_count.status_code == 200, clause_count.text
+    assert clause_count.json()["answer"]["answer"] == "14"
+    assert clause_count.json()["answer"]["status"] == "SUPPORTED"
+    assert clause_count.json()["answer"]["evidence"] == []
+    assert page_count.status_code == 200, page_count.text
+    assert page_count.json()["answer"]["answer"] == "3"
+
+    detail = client.get(
+        f"/workspaces/{workspace_id}/conversations/{conversation['conversation_id']}"
+    ).json()
+    assert detail["messages"][-3]["message_type"] == "document_metadata"
+    assert detail["messages"][-1]["content"] == "3"
+
+
 def test_follow_up_context_is_bounded_and_document_scoped(client, monkeypatch):
     workspace_id = client.post("/workspaces").json()["workspace_id"]
     first_doc = upload_document(client, f"/workspaces/{workspace_id}/documents", "first.pdf")

@@ -1,7 +1,7 @@
 """Workspace and conversation models for ClauseLens sessions."""
 
 from datetime import datetime, timezone
-from typing import Optional, Any
+from typing import Literal, Optional, Any
 from pydantic import BaseModel, Field
 
 
@@ -36,6 +36,7 @@ class ConversationMessage(BaseModel):
     message_id: str
     role: str  # "user" | "assistant"
     content: str
+    message_type: Literal["answer", "document_metadata"] = "answer"
     timestamp: str = Field(default_factory=_utcnow)
     document_id: Optional[str] = None
     answer_status: Optional[str] = None          # SUPPORTED / INSUFFICIENT_EVIDENCE / etc.

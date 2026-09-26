@@ -62,6 +62,12 @@ router = APIRouter(prefix="/workspaces", tags=["workspace"])
 
 MAX_FILE_SIZE = 15 * 1024 * 1024  # 15 MB
 MAX_HISTORY_TURNS = 3
+DOCUMENT_COUNT_RE = re.compile(
+    r"\b(?:how many|number of|count of|total number of)\s+"
+    r"(?P<kind>clauses?|sections?|pages?)\b|"
+    r"\btotal\s+(?P<total_kind>clauses?|sections?|pages?)\b",
+    re.IGNORECASE,
+)
 
 # ── Request / Response schemas ─────────────────────────────────────────────
 
@@ -181,6 +187,24 @@ def _comparison_sentences(
 
     candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
     return [(sentence, chunk) for _, _, _, sentence, _, chunk in candidates[:6]]
+
+
+def _document_count_request(question: str) -> str | None:
+    match = DOCUMENT_COUNT_RE.search(question)
+    if not match:
+        return None
+    return (match.group("kind") or match.group("total_kind")).lower().rstrip("s")
+
+
+def _document_count(document: Document, kind: str) -> int | None:
+    if kind == "page":
+        return document.page_count
+    section_numbers = {
+        chunk.section.strip()
+        for chunk in document.evidence
+        if chunk.section and chunk.section.strip()
+    }
+    return len(section_numbers) if section_numbers else None
 
 
 # ── Workspace lifecycle ────────────────────────────────────────────────────
@@ -435,6 +459,54 @@ def ask_question(
     # Update the conversation's active document if the user switched
     if active_doc_id != conv.active_document_id:
         conv.active_document_id = active_doc_id
+
+    count_kind = _document_count_request(request.question)
+    if count_kind:
+        count = _document_count(document, count_kind)
+        if count is None:
+            answer = LegalAnswer(
+                status="INSUFFICIENT_EVIDENCE",
+                answer="I couldn't reliably count numbered clauses in this document.",
+                explanation="No numbered clause or section headings were detected in the uploaded text.",
+                evidence=[],
+                missing_information=[],
+                follow_up_questions=[],
+            )
+        else:
+            answer = LegalAnswer(
+                status="SUPPORTED",
+                answer=str(count),
+                explanation="",
+                evidence=[],
+                missing_information=[],
+                follow_up_questions=[],
+            )
+
+        user_message = ConversationMessage(
+            message_id=str(uuid.uuid4()),
+            role="user",
+            content=request.question,
+            document_id=active_doc_id,
+        )
+        assistant_message = ConversationMessage(
+            message_id=str(uuid.uuid4()),
+            role="assistant",
+            content=answer.answer,
+            message_type="document_metadata",
+            document_id=active_doc_id,
+            answer_status=answer.status,
+            explanation=answer.explanation,
+        )
+        conv.messages.extend([user_message, assistant_message])
+        if conv.title == "New conversation":
+            conv.title = request.question.strip()[:80]
+        save_conversation(conv)
+
+        return QuestionResponse(
+            message_id=assistant_message.message_id,
+            answer=answer,
+            document_id=active_doc_id,
+        )
 
     # Keep conversation context isolated to the current document. History can
     # resolve references, but only newly retrieved evidence may ground claims.
