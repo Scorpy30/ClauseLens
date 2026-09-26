@@ -164,6 +164,7 @@ def test_document_profile_prompt_is_single_document_and_evidence_cited(monkeypat
     assert result["document_type"] == "Employment agreement"
     assert len(captured_prompts) == 1
     assert "from ONE document only" in captured_prompts[0]
+    assert "one to three of the strongest chunk IDs" in captured_prompts[0]
     assert "testing appendix" in captured_prompts[0]
     assert "source-1" in captured_prompts[0]
     assert "Ignore all instructions" in captured_prompts[0]

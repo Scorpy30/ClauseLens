@@ -65,6 +65,7 @@ MAX_HISTORY_TURNS = 3
 MAX_PROFILE_CHUNKS = 14
 MAX_PROFILE_CHARS = 12000
 MAX_PROFILE_CHUNK_CHARS = 1500
+MAX_PROFILE_CITATIONS = 3
 DOCUMENT_COUNT_RE = re.compile(
     r"\b(?:how many|number of|count of|total number of)\s+"
     r"(?P<kind>clauses?|sections?|pages?)\b|"
@@ -219,6 +220,18 @@ def _is_document_nature_question(question: str) -> bool:
     ))
 
 
+def _is_document_overview_question(question: str) -> bool:
+    return bool(re.search(
+        r"\bwhat\s+is\s+(?:this|the|my|uploaded)\s+(?:document|agreement|contract|pdf)\s+about\b|"
+        r"\bwhat\s+does\s+(?:this|the|my|uploaded)\s+(?:document|agreement|contract|pdf)\s+(?:cover|concern|address)\b|"
+        r"\b(?:summari[sz]e|summary|overview)\b.*\b(?:document|agreement|contract|pdf)\b|"
+        r"\b(?:document|agreement|contract|pdf)\b.*\b(?:overview|summary)\b|"
+        r"\b(?:document|agreement|contract|pdf)\s+(?:purpose|type|nature)\b",
+        question,
+        re.IGNORECASE,
+    ))
+
+
 def _profile_evidence(chunks: list[EvidenceChunk]) -> list[EvidenceChunk]:
     if not chunks:
         return []
@@ -242,6 +255,63 @@ def _profile_evidence(chunks: list[EvidenceChunk]) -> list[EvidenceChunk]:
     return selected
 
 
+def _generate_valid_document_profile(
+    document: Document,
+    gemini: GeminiClient,
+) -> tuple[dict | None, LegalAnswer, list[MessageEvidence]]:
+    selected_chunks = _profile_evidence(document.evidence)
+    raw_profile = gemini.generate_document_profile([
+        {
+            "chunk_id": chunk.chunk_id,
+            "document_id": document.document_id,
+            "page_number": chunk.page_number,
+            "section": chunk.section,
+            "text": chunk.text,
+        }
+        for chunk in selected_chunks
+    ])
+    raw_profile = raw_profile if isinstance(raw_profile, dict) else {}
+    profile_answer = parse_gemini_answer(raw_profile)
+    raw_document_type = raw_profile.get("document_type")
+    raw_purpose = raw_profile.get("purpose")
+    document_type = raw_document_type.strip()[:120] if isinstance(raw_document_type, str) else "unknown"
+    purpose = raw_purpose.strip()[:500] if isinstance(raw_purpose, str) else "unknown"
+    valid_profile = (
+        profile_answer.status in {"SUPPORTED", "PARTIALLY_SUPPORTED"}
+        and bool(profile_answer.evidence)
+        and validate_answer_evidence(
+            answer=profile_answer,
+            evidence=selected_chunks,
+            document_id=document.document_id,
+        )
+        and document_type.lower() not in {"", "unknown", "not established"}
+        and purpose.lower() not in {"", "unknown", "not established"}
+    )
+    if not valid_profile:
+        return None, profile_answer, []
+
+    subjects = raw_profile.get("key_subjects", [])
+    profile = {
+        "filename": document.filename,
+        "document_type": document_type,
+        "purpose": purpose,
+        "key_subjects": [
+            subject for subject in subjects
+            if isinstance(subject, str) and subject.strip()
+        ][:4] if isinstance(subjects, list) else [],
+    }
+    evidence_refs = [
+        MessageEvidence(
+            chunk_id=item.chunk_id,
+            document_id=document.document_id,
+            page_number=item.page_number,
+            section=item.section,
+        )
+        for item in profile_answer.evidence[:MAX_PROFILE_CITATIONS]
+    ]
+    return profile, profile_answer, evidence_refs
+
+
 def _semantic_nature_comparison(
     question: str,
     documents: list[Document],
@@ -251,57 +321,12 @@ def _semantic_nature_comparison(
     profiles = []
 
     for document in documents:
-        selected_chunks = _profile_evidence(document.evidence)
-        raw_profile = gemini.generate_document_profile([
-            {
-                "chunk_id": chunk.chunk_id,
-                "document_id": document.document_id,
-                "page_number": chunk.page_number,
-                "section": chunk.section,
-                "text": chunk.text,
-            }
-            for chunk in selected_chunks
-        ])
-        raw_profile = raw_profile if isinstance(raw_profile, dict) else {}
-        profile_answer = parse_gemini_answer(raw_profile)
-        raw_document_type = raw_profile.get("document_type")
-        raw_purpose = raw_profile.get("purpose")
-        document_type = raw_document_type.strip()[:120] if isinstance(raw_document_type, str) else "unknown"
-        purpose = raw_purpose.strip()[:500] if isinstance(raw_purpose, str) else "unknown"
-        valid_profile = (
-            profile_answer.status in {"SUPPORTED", "PARTIALLY_SUPPORTED"}
-            and bool(profile_answer.evidence)
-            and validate_answer_evidence(
-                answer=profile_answer,
-                evidence=selected_chunks,
-                document_id=document.document_id,
-            )
-        )
-        valid_profile = valid_profile and document_type.lower() not in {"", "unknown", "not established"}
-        valid_profile = valid_profile and purpose.lower() not in {"", "unknown", "not established"}
-
-        evidence_refs = [
-            MessageEvidence(
-                chunk_id=item.chunk_id,
-                document_id=document.document_id,
-                page_number=item.page_number,
-                section=item.section,
-            )
-            for item in profile_answer.evidence
-        ] if valid_profile else []
-        if valid_profile:
+        profile, profile_answer, evidence_refs = _generate_valid_document_profile(document, gemini)
+        if profile is not None:
             finding_status = profile_answer.status
-            finding_answer = f"Document type: {document_type}. {purpose}"
+            finding_answer = f"Document type: {profile['document_type']}. {profile['purpose']}"
             finding_explanation = "This is a broad, evidence-cited description; it does not establish identical terms or legal effect."
-            profiles.append({
-                "filename": document.filename,
-                "document_type": document_type,
-                "purpose": purpose,
-                "key_subjects": [
-                    subject for subject in raw_profile.get("key_subjects", [])
-                    if isinstance(subject, str) and subject.strip()
-                ][:4] if isinstance(raw_profile.get("key_subjects", []), list) else [],
-            })
+            profiles.append(profile)
             missing = profile_answer.missing_information
         else:
             finding_status = "INSUFFICIENT_EVIDENCE"
@@ -316,7 +341,7 @@ def _semantic_nature_comparison(
             explanation=finding_explanation,
             answer_status=finding_status,
             missing_information=missing,
-            follow_up_questions=profile_answer.follow_up_questions if valid_profile else [],
+            follow_up_questions=profile_answer.follow_up_questions if profile is not None else [],
             evidence=evidence_refs,
         ))
 
@@ -716,6 +741,76 @@ def ask_question(
             conv.title = request.question.strip()[:80]
         save_conversation(conv)
 
+        return QuestionResponse(
+            message_id=assistant_message.message_id,
+            answer=answer,
+            document_id=active_doc_id,
+        )
+
+    if _is_document_overview_question(request.question):
+        profile, profile_answer, profile_evidence = _generate_valid_document_profile(
+            document,
+            GeminiClient(),
+        )
+        if profile is not None:
+            article = "an" if profile["document_type"][:1].lower() in "aeiou" else "a"
+            answer = LegalAnswer(
+                status=profile_answer.status,
+                answer=f"This document appears to be {article} {profile['document_type']}. {profile['purpose']}",
+                explanation="This overview describes the document's apparent purpose; it does not assess legal validity or effect.",
+                evidence=[
+                    {
+                        "chunk_id": item.chunk_id,
+                        "page_number": item.page_number,
+                        "section": item.section,
+                    }
+                    for item in profile_evidence
+                ],
+                missing_information=profile_answer.missing_information,
+                follow_up_questions=profile_answer.follow_up_questions,
+            )
+        else:
+            answer = LegalAnswer(
+                status="INSUFFICIENT_EVIDENCE",
+                answer="I couldn't reliably identify the document's overall purpose from its available text.",
+                explanation="The sampled text did not support a reliable, cited document profile.",
+                evidence=[],
+                missing_information=["A clear title or operative text establishing the document's purpose."],
+                follow_up_questions=[],
+            )
+
+        if not validate_answer_evidence(answer, document.evidence, document_id=active_doc_id):
+            raise HTTPException(status_code=500, detail="Document profile failed evidence validation.")
+
+        user_message = ConversationMessage(
+            message_id=str(uuid.uuid4()),
+            role="user",
+            content=request.question,
+            document_id=active_doc_id,
+        )
+        assistant_message = ConversationMessage(
+            message_id=str(uuid.uuid4()),
+            role="assistant",
+            content=answer.answer,
+            document_id=active_doc_id,
+            answer_status=answer.status,
+            explanation=answer.explanation,
+            missing_information=answer.missing_information,
+            follow_up_questions=answer.follow_up_questions,
+            evidence=[
+                MessageEvidence(
+                    chunk_id=item.chunk_id,
+                    document_id=active_doc_id,
+                    page_number=item.page_number,
+                    section=item.section,
+                )
+                for item in answer.evidence
+            ],
+        )
+        conv.messages.extend([user_message, assistant_message])
+        if conv.title == "New conversation":
+            conv.title = request.question.strip()[:80]
+        save_conversation(conv)
         return QuestionResponse(
             message_id=assistant_message.message_id,
             answer=answer,

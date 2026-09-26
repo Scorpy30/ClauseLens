@@ -443,3 +443,57 @@ def test_document_nature_comparison_profiles_each_source_independently(client, m
     assert {profile["filename"] for profile in comparison_inputs} == {"first.pdf", "second.pdf"}
     for finding in result["per_document"]:
         assert finding["answer"]["evidence"]
+
+
+def test_document_overview_profiles_whole_document_with_few_citations(client, monkeypatch):
+    workspace_id = client.post("/workspaces").json()["workspace_id"]
+    document = upload_document(client, f"/workspaces/{workspace_id}/documents", "sample.pdf")
+    conversation = client.post(
+        f"/workspaces/{workspace_id}/conversations",
+        json={"active_document_id": document["document_id"]},
+    ).json()
+    profile_inputs = []
+    monkeypatch.setattr(GeminiClient, "__init__", lambda self, *args, **kwargs: None)
+    monkeypatch.setattr(
+        "backend.routes.workspace.map_topics",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("document overviews should profile the whole file")),
+    )
+
+    def profile_document(self, evidence):
+        profile_inputs.extend(evidence)
+        return {
+            "status": "SUPPORTED",
+            "document_type": "Employment agreement",
+            "purpose": "Sets out employment terms and related obligations.",
+            "key_subjects": ["employment", "notice"],
+            "answer": "An employment agreement.",
+            "explanation": "",
+            "evidence": [
+                {
+                    "chunk_id": item["chunk_id"],
+                    "page_number": item["page_number"],
+                    "section": item["section"],
+                }
+                for item in evidence
+            ],
+            "missing_information": [],
+            "follow_up_questions": [],
+        }
+
+    monkeypatch.setattr(GeminiClient, "generate_document_profile", profile_document)
+    monkeypatch.setattr(
+        GeminiClient,
+        "generate_legal_answer",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("overview should not use question-only retrieval")),
+    )
+    response = client.post(
+        f"/workspaces/{workspace_id}/conversations/{conversation['conversation_id']}/questions",
+        json={"question": "What is this document about?"},
+    )
+
+    assert response.status_code == 200, response.text
+    answer = response.json()["answer"]
+    assert answer["status"] == "SUPPORTED"
+    assert answer["answer"].startswith("This document appears to be an Employment agreement.")
+    assert len(profile_inputs) == len(document["evidence"])
+    assert 1 <= len(answer["evidence"]) <= 3
